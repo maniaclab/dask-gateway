@@ -14,12 +14,26 @@ FROM python:3.13-slim-bullseye
 LABEL org.opencontainers.image.source="https://github.com/dask/dask-gateway"
 LABEL org.opencontainers.image.url="https://github.com/dask/dask-gateway/blob/HEAD/dask-gateway-server/Dockerfile"
 
+
+
 # Install tini and upgrade linux packages are updated to patch known
 # vulnerabilities.
 RUN apt-get update \
  && apt-get upgrade -y \
  && apt-get install -y \
         tini \
+        gnupg \
+        wget \
+ && rm -rf /var/lib/apt/lists/*
+
+
+RUN echo "deb https://research.cs.wisc.edu/htcondor/repo/debian/24.x bullseye main" >>  /etc/apt/sources.list.d/htcondor.list;
+RUN wget -qO - https://research.cs.wisc.edu/htcondor/repo/keys/HTCondor-24.x-Key |  apt-key add -
+
+RUN apt-get update \
+ && apt-get upgrade -y \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        condor \
  && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user to run as
@@ -36,6 +50,8 @@ WORKDIR /home/dask/
 COPY --chown=dask:dask . /opt/dask-gateway-server
 RUN DASK_GATEWAY_SERVER__NO_PROXY=true pip install --no-cache-dir \
         -r /opt/dask-gateway-server/Dockerfile.requirements.txt
+
+RUN pip3  install dask-jobqueue requests --upgrade
 
 ENTRYPOINT ["tini", "-g", "--"]
 CMD ["dask-gateway-server", "--config", "/etc/dask-gateway/dask_gateway_config.py"]
