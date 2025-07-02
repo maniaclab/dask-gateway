@@ -24,6 +24,7 @@ RUN apt-get update \
         tini \
         gnupg \
         wget \
+        curl \
  && rm -rf /var/lib/apt/lists/*
 
 
@@ -37,10 +38,12 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user to run as
-RUN useradd --create-home --user-group --uid 1000 dask
+RUN useradd --create-home --user-group --uid 1000 -d /daskhome/dask dask
+COPY sync_users.sh sync_users_run.sh /usr/local/ciconnect/
+
 USER dask:dask
-ENV PATH=/home/dask/.local/bin:$PATH
-WORKDIR /home/dask/
+ENV PATH=/daskhome/dask/.local/bin:$PATH
+WORKDIR /daskhome/dask/
 
 # Install dask-gateway-server
 #

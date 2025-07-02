@@ -53,6 +53,8 @@ import base64
 import tempfile
 import os
 from functools import lru_cache
+import requests
+import re
 
 def merge_dicts(*dict_args):
     """
@@ -64,118 +66,160 @@ def merge_dicts(*dict_args):
         result.update(dictionary)
     return result
 
-
-
-def parse_condor_q(json_data):
+async def run_as_user(username: str, command: list[str]) -> str:
     """
-    Parses the JSON output of `condor_q -json` and returns a dict of job IDs grouped by status.
+    Run a shell command as the specified user using su, and return its stdout.
 
     Args:
-        json_data (str or list): JSON string or already-parsed list from `condor_q -json`.
+        username (str): the username to run as (e.g. 'alice')
+        command (list[str]): the command and its arguments, e.g. ['ls', '-la']
 
     Returns:
-        dict: {
-            "pending": [JobId, ...],
-            "running": [...],
-            "completed": [...],
-            "hold": [...],
-            "removed": [...],
-            "suspended": [...]
-        }
+        str: stdout of the command, decoded to a string
+
+    Raises:
+        RuntimeError if the command fails
     """
-    if isinstance(json_data, str):
-        if not json_data.strip():  # empty or whitespace-only
-            return {key: [] for key in ["pending", "running", "completed", "hold", "removed", "suspended"]}
-        try:
-            jobs_data = json.loads(json_data)
-        except json.JSONDecodeError:
-            raise ValueError("Invalid JSON input.")
-    elif isinstance(json_data, list):
-        jobs_data = json_data
-    else:
-        raise ValueError("Input must be a JSON string or list of job dictionaries.")
+    # convert command list to a properly quoted string
+    command_str = " ".join(shlex.quote(arg) for arg in command)
 
-    # HTCondor JobStatus mapping
-    status_map = {
-        0: "unexpanded",  # Rarely seen
-        1: "pending",     # Idle
-        2: "running",
-        3: "removed",
-        4: "completed",
-        5: "hold",
-        6: "transferring_output",  # optional to include
-        7: "suspended"
-    }
+    # su -c expects the whole command as a single string
+    cmd = ['su', '-', username, '-c', command_str]
 
-    # Initialize result dict with all statuses of interest
-    result = {status: [] for status in ["pending", "running", "completed", "hold", "removed", "suspended"]}
+    # run the subprocess
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
+    )
 
-    for job in jobs_data:
-        status_code = job.get("JobStatus")
-        status_str = status_map.get(status_code)
-        if status_str in result:
-            job_id = f'{job.get("ClusterId")}.{job.get("ProcId", 0)}'
-            result[status_str].append(job_id)
+    stdout, stderr = await process.communicate()
 
-    return result
+    if process.returncode != 0:
+        raise RuntimeError(
+            f"Command failed with return code {process.returncode}: {stderr.decode()}"
+        )
+
+    return stdout.decode()
+
+def run_as_user_sync(username: str, command: list[str]) -> str:
+    """
+    Synchronously run a shell command as the specified user using su, and return its stdout.
+
+    Args:
+        username (str): the username to run as (e.g. 'alice')
+        command (list[str]): the command and its arguments, e.g. ['ls', '-la']
+
+    Returns:
+        str: stdout of the command, decoded to a string
+
+    Raises:
+        RuntimeError: if the command fails
+    """
+    # safely quote each argument
+    command_str = " ".join(shlex.quote(arg) for arg in command)
+
+    # su expects the entire command as a single string
+    cmd = ['su', '-', username, '-c', command_str]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+            text=True
+        )
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"Command failed with return code {e.returncode}: {e.stderr}"
+        )
+
+    return result.stdout
 
 class GW_HTCJob(HTCondorJob):
     """
+    An implementation for launching Dask workers in
+    HTCondor pools, integrating with Kubernetes Dask Gateway clusters.
 
+    Provides:
+      - consistent naming with a counter
+      - user lookup via CI Connect
+      - automatic parsing of condor_q JSON
+      - job customization with worker images, scheduler ports, etc.
     """
+
     submit_command = "condor_submit -spool"
     query_command = "condor_q"
     cancel_command = "condor_rm"
-    _counter = 0
 
-    def __init__(self,
-                 *,
-                 #security=None,
-                 #user=None,
-                 cluster=None,
-                 kube_controller=None,
-                 worker_image=None,
-                 scheduler_options=None,
-                 scheduler_port=DEFAULT_SCHEDULER_PORT,
-                 dashboard_port=DEFAULT_DASHBOARD_PORT,
-                 nanny_port=DEFAULT_NANNY_PORT,
-                 **job_kwargs):
+    # Regular expression to parse a job id like 123.0 from condor_submit output
+    job_id_regexp = r"(?P<job_id>\d+\.\d*)"
+
+    _counter = 0  # Class-level counter for unique job names
+
+    def __init__(
+        self,
+        *,
+        cluster: dict,
+        kube_controller,
+        worker_image: str,
+        scheduler_options: dict = None,
+        scheduler_port: int = DEFAULT_SCHEDULER_PORT,
+        dashboard_port: int = DEFAULT_DASHBOARD_PORT,
+        nanny_port: int = DEFAULT_NANNY_PORT,
+        **job_kwargs
+    ):
         """
         Parameters
         ----------
-        worker_image:
-        scheduler_port:
-            Defaults to 8786.
-        dashboard_port:
-            Defaults to 8787.
-        container_port:
-            Defaults to 8786.
-        nanny_port:
-            Defaults to 8001.
-        disk:
-            Total amount of disk per job (defaults to 5 GiB).
-        cores:
-            Total number of cores per job (defaults to 4 cores).
-        memory:
-            Total amount of memory per job (defaults to 6 GB).
+        cluster : dict
+            Dask cluster metadata
+        kube_controller
+            Kubernetes controller interface
+        worker_image : str
+            Docker image for the worker
+        scheduler_port : int
+            Dask scheduler port (default 8786)
+        dashboard_port : int
+            Dask dashboard port (default 8787)
+        nanny_port : int
+            Dask nanny port (default 8001)
         scheduler_options : dict
-            Extra scheduler options for the job (Dask specific).
-        job_extra_directives : dict
-            Extra submit file attributes for the job (HTCondor specific).
-
-        Examples
-        --------
+            Additional scheduler options
         """
-        namespace = cluster["metadata"]["namespace"]
-        name = cluster["metadata"]["name"]
+        self.namespace = cluster["metadata"]["namespace"]
+        self.name = cluster["metadata"]["name"]
+        self.log = kube_controller.log
+        self.user = GW_HTCJob.userlookup(email=cluster["spec"]["username"])
 
-        job_kwargs["name"] = "dask-" + name + f"-{GW_HTCJob._counter:06d}"
-        GW_HTCJob._counter +=1
+        # initialize counter from existing jobs, only once
+        if GW_HTCJob._counter == 0:
+            try:
+                constraint = f'regexp("dask-[0-9a-fA-F]+-\\d+", JobBatchName)'
+                out = run_as_user_sync(
+                    self.user,
+                    shlex.split(GW_HTCJob.query_command)
+                    + ["-constraint", constraint, "-all", "-af", "JobBatchName"]
+                )
+                self.log.debug("Existing dask jobs found: %s", out)
+                GW_HTCJob._counter = (
+                    GW_HTCJob.max_index_from_dask_names(out.splitlines()) + 1 if out else 0
+                )
+            except Exception as e:
+                self.log.warning("Unable to initialize _counter, defaulting to 0: %s", e)
+                GW_HTCJob._counter = 0
 
+            self.log.info("Starting _counter at: %d", GW_HTCJob._counter)
+
+        # assign a unique name with the counter
+        job_name = f"dask-{self.name}-{GW_HTCJob._counter:06d}"
+        job_kwargs["name"] = job_name
+        GW_HTCJob._counter += 1
+
+        # finalize job kwargs
         job_kwargs = self._modify_job_kwargs(
             job_kwargs,
-            #security=security,
-            #user=user,
             cluster=cluster,
             kube_controller=kube_controller,
             worker_image=worker_image,
@@ -183,75 +227,240 @@ class GW_HTCJob(HTCondorJob):
             dashboard_port=dashboard_port,
             nanny_port=nanny_port,
         )
+
         super().__init__(**job_kwargs)
 
     @property
-    def counter(self):
-        """Return the total number of instances created so far."""
+    def counter(self) -> int:
+        """
+        Returns
+        -------
+        int
+            The current class-level job counter.
+        """
         return GW_HTCJob._counter
 
-    @classmethod
-    async def job_summery(cls, name):
-       out = await Job._call(shlex.split(cls.query_command) + ["-constraint", f'regexp(\"dask-{name}-.*\", JobBatchName)', '-json'] )
-       summery = parse_condor_q(out)
-       return summery
+    @staticmethod
+    def parse_condor_q(json_data) -> dict:
+        """
+        Parse the JSON output of `condor_q -json` and group job IDs by status.
+
+        Parameters
+        ----------
+        json_data : str or list
+            JSON string or parsed list of dicts.
+
+        Returns
+        -------
+        dict
+            {
+                "pending": [job_ids],
+                "running": [job_ids],
+                ...
+            }
+        """
+        if isinstance(json_data, str):
+            if not json_data.strip():
+                return {key: [] for key in ["pending", "running", "completed", "hold", "removed", "suspended"]}
+            try:
+                jobs_data = json.loads(json_data)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Invalid JSON input: {e}")
+        elif isinstance(json_data, list):
+            jobs_data = json_data
+        else:
+            raise ValueError("Input must be a JSON string or a list of dicts.")
+
+        status_map = {
+            0: "unexpanded",
+            1: "pending",
+            2: "running",
+            3: "removed",
+            4: "completed",
+            5: "hold",
+            6: "transferring_output",
+            7: "suspended"
+        }
+
+        result = {status: [] for status in ["pending", "running", "completed", "hold", "removed", "suspended"]}
+
+        for job in jobs_data:
+            status_str = status_map.get(job.get("JobStatus"))
+            if status_str in result:
+                cluster_id = job.get("ClusterId")
+                proc_id = job.get("ProcId", 0)
+                result[status_str].append(f"{cluster_id}.{proc_id}")
+
+        return result
+
+    @staticmethod
+    def max_index_from_dask_names(lines: list[str]) -> int:
+        """
+        Parse a list of dask names, extracting 6-digit indices.
+
+        Returns
+        -------
+        int
+            maximum index found, or 0 if none
+        """
+        pattern = re.compile(r"-([0-9]{6})$")
+        indices = [
+            int(match.group(1))
+            for line in lines
+            if (match := pattern.search(line))
+        ]
+        return max(indices, default=0)
 
     @classmethod
-    async def stop_HTC(cls, job_id):
-       if job_id:
-           with suppress(RuntimeError):  # deleting job when job already gone
-               return await Job._call(shlex.split(cls.cancel_command) + [job_id])
+    async def job_summery(cls, name: str, username: str) -> dict:
+        """
+        Summarize jobs for a given cluster name and user.
+        """
+        constraint = f'regexp("dask-{name}-.*", JobBatchName)'
+        out = await run_as_user(username, shlex.split(cls.query_command) + ["-constraint", constraint, "-json"])
+        return cls.parse_condor_q(out)
 
     @classmethod
-    def _modify_job_kwargs(cls,
-                           job_kwargs,
-                           *,
-                           #security=None,
-                           user=None,
-                           cluster=None,
-                           kube_controller=None,
-                           worker_image=None,
-                           scheduler_options=None,
-                           scheduler_port=DEFAULT_SCHEDULER_PORT,
-                           dashboard_port=DEFAULT_DASHBOARD_PORT,
-                           nanny_port=DEFAULT_NANNY_PORT
-                           ):
+    async def stop_HTC(cls, job_id: str, username: str):
+        """
+        Stop a running HTCondor job.
+        """
+        if job_id:
+            with suppress(RuntimeError):
+                return await run_as_user(username, shlex.split(cls.cancel_command) + [job_id])
+
+    @classmethod
+    def _modify_job_kwargs(
+        cls,
+        job_kwargs: dict,
+        *,
+        cluster: dict,
+        kube_controller,
+        worker_image: str,
+        scheduler_options: dict = None,
+        scheduler_port: int = DEFAULT_SCHEDULER_PORT,
+        dashboard_port: int = DEFAULT_DASHBOARD_PORT,
+        nanny_port: int = DEFAULT_NANNY_PORT
+    ) -> dict:
+        """
+        Patch in dask-specific submit file parameters.
+        """
         namespace = cluster["metadata"]["namespace"]
         name = cluster["metadata"]["name"]
 
-        job_config = job_kwargs.copy()
-        input_files = ["env.sh"] + list(kube_controller.paths[name].values())
+        input_files = ["/etc/condor/dask/env.sh"] + list(kube_controller.paths[name].values())
 
-        ## Job extra settings (HTCondor ClassAd)
+        # Merge classAd attributes
+        job_config = job_kwargs.copy()
         job_config["job_extra_directives"] = merge_dicts(
             {
                 "universe": "docker",
-                "docker_image": worker_image
-            },
-            {
+                "docker_image": worker_image,
                 "container_service_names": "dask,nanny",
-                "dask_container_port": DEFAULT_CONTAINER_PORT,
-                "nanny_container_port": DEFAULT_NANNY_PORT,
-            },
-            {"transfer_input_files": ", ".join(str(p) for p in input_files) },
-            #{"encrypt_input_files": files},
-            {"transfer_output_files": ""},
-            {"when_to_transfer_output": "ON_EXIT"},
-            {"should_transfer_files": "YES"},
-            {"Stream_Output": "False"},
-            {"Stream_Error": "False"},
-            #{"+DaskSchedulerAddress": external_ip_string},
-            #job_kwargs.get(
-            #    "job_extra_directives", dask.config.get(f"jobqueue.{cls.config_name}.job_extra_directives")
-            #),
-            {
-                #"DaskClusterID":
+                "dask_container_port": scheduler_port,
+                "nanny_container_port": nanny_port,
+                "transfer_input_files": ", ".join(str(p) for p in input_files),
+                "transfer_output_files": "",
+                "when_to_transfer_output": "ON_EXIT",
+                "should_transfer_files": "YES",
+                "Stream_Output": "False",
+                "Stream_Error": "False",
                 "+queue": '"short"',
-                #"Environment": '"DASK_GATEWAY_API_URL=http://api-dask-gateway.dask-gateway:8000/api DASK_GATEWAY_CLUSTER_NAME=dask-gateway.8bddf20b78904fc3a1647bf8b977674d DASK_GATEWAY_API_TOKEN=/data/fengping/dask/api-token DASK_DISTRIBUTED__COMM__TLS__CA_FILE=/data/fengping/dask/dask.crt  DASK_DISTRIBUTED__COMM__TLS__SCHEDULER__CERT=/data/fengping/dask/dask.crt DASK_DISTRIBUTED__COMM__TLS__SCHEDULER__KEY=/data/fengping/dask/dask.pem DASK_DISTRIBUTED__COMM__TLS__WORKER__CERT=/data/fengping/dask/dask.crt DASK_DISTRIBUTED__COMM__TLS__WORKER__KEY=/data/fengping/dask/dask.pem"'
-                "Environment": f'"DASK_GATEWAY_API_URL={kube_controller.api_url} DASK_GATEWAY_CLUSTER_NAME={namespace}.{name}"'
+                "Environment": (
+                    f'"DASK_GATEWAY_API_URL={kube_controller.api_url} '
+                    f'DASK_GATEWAY_CLUSTER_NAME={namespace}.{name}"'
+                )
             }
         )
         return job_config
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def userlookup(email: str = None, name: str = None, log=None, default: str = "dask") -> str:
+        """
+        Look up the UNIX username for the given CI Connect user, verifying AF group membership.
+        """
+        apitoken = os.getenv("API_TOKEN")
+        if not apitoken:
+            return default
+
+        try:
+            response = requests.get(
+                f"https://api.ci-connect.net:18080/v1alpha1/users?token={apitoken}",
+                timeout=5
+            )
+            response.raise_for_status()
+            users = response.json().get("items", [])
+        except Exception:
+            return default
+
+        user = None
+
+        if name:
+            user = next(
+                (u for u in users
+                 if u.get("kind") == "User" and u["metadata"].get("name", "").casefold() == name.casefold()),
+                None
+            )
+        if not user and email:
+            user = next(
+                (u for u in users
+                 if u.get("kind") == "User" and u["metadata"].get("email", "").casefold() == email.casefold()),
+                None
+            )
+
+        if user:
+            unix_name = user["metadata"].get("unix_name")
+            if not unix_name:
+                return default
+            try:
+                detail_resp = requests.get(
+                    f"https://api.ci-connect.net:18080/v1alpha1/users/{unix_name}?token={apitoken}",
+                    timeout=5
+                )
+                detail_resp.raise_for_status()
+                user_detail = detail_resp.json()
+                memberships = user_detail.get("metadata", {}).get("group_memberships", [])
+                if any(
+                    m for m in memberships
+                    if m.get("name") == "root.atlas-af" and m.get("state") in {"active", "admin"}
+                ):
+                    return unix_name
+            except Exception:
+                return default
+        return default
+
+    async def _submit_job(self, script_filename: str) -> str:
+        """
+        Submits a HTCondor job script and returns the output.
+        """
+        return await run_as_user(self.user, shlex.split(self.submit_command) + [script_filename])
+
+    def _job_id_from_submit_output(self, out: str) -> str:
+        """
+        Parse the condor_submit output to extract a job id.
+        """
+        match = re.search(self.job_id_regexp, out)
+        if not match:
+            raise ValueError(
+                f"Could not parse job id from output. "
+                f"Regexp: {self.job_id_regexp}, Output: {out}"
+            )
+        job_id = match.group("job_id")
+        if not job_id:
+            raise ValueError(
+                "Your job_id regexp does not include a group named 'job_id'. "
+                f"Regexp: {self.job_id_regexp}"
+            )
+        return job_id
+
+    async def start(self):
+        """
+        Start the HTCondor job.
+        """
+        with self.job_file() as fn:
+            out = await self._submit_job(fn)
+            self.job_id = self._job_id_from_submit_output(out)
 
 def get_container_status(pod, name):
     """Get the status of container ``name`` from a pod"""
@@ -720,12 +929,13 @@ class KubeController(KubeBackendAndControllerMixin, Application):
         Asynchronously extracts 'api-token', 'dask.crt', and 'dask.pem' from a Kubernetes secret,
         writes them to temp files, and returns a dict of their paths.
         """
-        v1 = client.CoreV1Api()
+        #v1 = client.CoreV1Api()
         #secret = await v1.read_namespaced_secret(secret_name, namespace)
         secret = await self.core_client.read_namespaced_secret(secret_name, namespace)
 
         required_keys = ["api-token", "dask.crt", "dask.pem"]
         temp_dir = tempfile.mkdtemp()
+        os.chmod(temp_dir, 0o755)
         file_paths = {}
 
         for key in required_keys:
@@ -884,11 +1094,12 @@ class KubeController(KubeBackendAndControllerMixin, Application):
             status = status.copy()
             status["phase"] = "Stopped"
             status["completionTime"] = k8s_timestamp()
+            user = GW_HTCJob.userlookup(email=cluster["spec"]["username"])
             # remove htc jobs
             await self.handle_scale_down_htc(
                         cluster,
                         0,
-                        await GW_HTCJob.job_summery(name),
+                        await GW_HTCJob.job_summery(name, user),
                         statuses_to_check=["pending", "running", "removed", "completed", "hold", "transferring_output"]
                     )
             return status, False
@@ -988,7 +1199,9 @@ class KubeController(KubeBackendAndControllerMixin, Application):
             status["completionTime"] = k8s_timestamp()
 
         elif sched_state == "running":
-            summery = await GW_HTCJob.job_summery(name)
+            user = GW_HTCJob.userlookup(email=cluster["spec"]["username"],log=self.log)
+            self.log.info("email: %s user: %s", cluster["spec"]["username"], user)
+            summery = await GW_HTCJob.job_summery(name, user)
             self.log.debug("summery: %s", summery)
             self.log.debug("path: %s", self.paths.get(name))
 
@@ -1117,14 +1330,6 @@ class KubeController(KubeBackendAndControllerMixin, Application):
         cmd = self.get_worker_command(namespace, name, config)
         self.log.info("cluster %s: - config: %s,%s, image: %s,user: %s", name, config.worker_memory, config.worker_cores, config.image, cluster["spec"]["username"] )
 
-        #user = GW_HTCJob.userlookup(email=cluster["spec"]["username"])
-        #if user:
-        #    username = user["metadata"]["unix_name"]
-        #    self.log.info("user %s", username)
-        #else:
-        #    username = "notfound"
-        #    self.log.info("user not found")
-
         jobs = [GW_HTCJob(cores=config.worker_cores,
                         memory=config.worker_memory,
                         processes=1,
@@ -1147,34 +1352,23 @@ class KubeController(KubeBackendAndControllerMixin, Application):
         #with open("/tmp/jobscript", "w") as f:
         #    f.write(jobs[0].job_script())
         job_starts = [job.start() for job in jobs]
-        res1 = await asyncio.gather(*job_starts, return_exceptions=True)
+        res = await asyncio.gather(*job_starts, return_exceptions=True)
 
-        pod = self.make_pod(namespace, name, config, is_worker=True)
-        pod["metadata"]["ownerReferences"] = [
-            {
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "name": sched_pod["metadata"]["name"],
-                "uid": sched_pod["metadata"]["uid"],
-            }
-        ]
-        to_delete = info.succeeded.union(info.failed)
-        info.set_expectations(creates=delta, deletes=len(to_delete))
+        #to_delete = info.succeeded.union(info.failed)
+        #info.set_expectations(creates=delta, deletes=len(to_delete))
         self.log.info(
-            "Cluster %s.%s scaled to %d - creating %d workers, deleting %d stopped workers",
+                "Cluster %s.%s scaled to %d - creating %d workers: %s",
             namespace,
             name,
             replicas,
             delta,
-            len(to_delete),
+            [job.job_id for job in jobs],
         )
-        #failed = await self.batch_create_pods(info, namespace, pod, delta)
-        #failed = await job.start()
-        res = await asyncio.gather(
-            *(self.delete_pod(namespace, p, info) for p in to_delete),
-            return_exceptions=True,
-        )
-        return any(isinstance(r, Exception) for r in res1)
+        #res = await asyncio.gather(
+        #    *(self.delete_pod(namespace, p, info) for p in to_delete),
+        #    return_exceptions=True,
+        #)
+        return any(isinstance(r, Exception) for r in res)
 
     async def handle_scale_down(self, cluster, sched_pod, info, replicas, delta):
         namespace = cluster["metadata"]["namespace"]
@@ -1217,15 +1411,15 @@ class KubeController(KubeBackendAndControllerMixin, Application):
 
         if jobs_to_process:
             self.log.info(
-                    "Cluster %s.%s scaled to %d - deleting jobs in %s - %s\n",
+                    "Cluster %s.%s scaled to %d - deleting jobs in %s - %s",
                 namespace,
                 name,
                 replicas,
                 statuses_to_check,
                 jobs_to_process
             )
-
-            job_stops = [GW_HTCJob.stop_HTC(jid) for jid in jobs_to_process]
+            user = GW_HTCJob.userlookup(email=cluster["spec"]["username"])
+            job_stops = [GW_HTCJob.stop_HTC(jid, user) for jid in jobs_to_process]
             res = await asyncio.gather(*job_stops, return_exceptions=True)
             self.log.debug("delete jobs stdout: %s",res)
 
