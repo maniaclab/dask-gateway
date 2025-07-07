@@ -1217,9 +1217,14 @@ class KubeController(KubeBackendAndControllerMixin, Application):
                 self.log.info("cluster: %s - n_workers:%d, replicas: %d", name, n_workers, replicas)
 
                 delta = replicas - n_workers
-                if delta > 0:
+                if delta >= 0:
                     requeue = await self.handle_scale_up_htc(
                         cluster, sched_pod, info, replicas, delta
+                    )
+                    #remove completed, hold removed jobs to keep running jobs in consistant with sched's command
+                    await self.handle_scale_down_htc(
+                        cluster, replicas, summery,
+                        statuses_to_check=["removed", "completed", "hold"]
                     )
                 elif delta < 0: # when delta is 0, do nothing.
                     requeue = await self.handle_scale_down_htc(
