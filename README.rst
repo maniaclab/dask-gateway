@@ -14,6 +14,12 @@ support for dynamically provisioning Dask workers on an HTCondor cluster.
 The enhancements allow Dask clusters to be elastically scaled using HTCondor
 jobs instead of directly launching Kubernetes pods for workers.
 
+Architecture Overview
+============
+.. image:: dask.htcondor.svg
+   :alt: Arch Diagram for HTCondor Dask Kubernetes Controller
+
+
 Key Features
 ============
 
