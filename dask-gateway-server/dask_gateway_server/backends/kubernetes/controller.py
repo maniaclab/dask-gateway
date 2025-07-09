@@ -56,6 +56,14 @@ from functools import lru_cache
 import requests
 import re
 
+from traitlets import TraitType, Instance
+class CallableTrait(TraitType):
+    """A trait for callable objects (e.g. functions)."""
+    def validate(self, obj, value):
+        if not callable(value):
+            self.error(obj, value)
+        return value
+
 def merge_dicts(*dict_args):
     """
     Given any number of dictionaries, shallow copy and merge into a new dict,
@@ -191,7 +199,7 @@ class GW_HTCJob(HTCondorJob):
         self.namespace = cluster["metadata"]["namespace"]
         self.name = cluster["metadata"]["name"]
         self.log = kube_controller.log
-        self.user = GW_HTCJob.userlookup(email=cluster["spec"]["username"])
+        self.user = kube_controller.usermap(cluster["spec"]["username"])
 
         # initialize counter from existing jobs, only once
         if GW_HTCJob._counter == 0:
@@ -374,62 +382,6 @@ class GW_HTCJob(HTCondorJob):
         )
         return job_config
 
-    @staticmethod
-    @lru_cache(maxsize=128)
-    def userlookup(email: str = None, name: str = None, log=None, default: str = "dask") -> str:
-        """
-        Look up the UNIX username for the given CI Connect user, verifying AF group membership.
-        """
-        apitoken = os.getenv("API_TOKEN")
-        if not apitoken:
-            return default
-
-        try:
-            response = requests.get(
-                f"https://api.ci-connect.net:18080/v1alpha1/users?token={apitoken}",
-                timeout=5
-            )
-            response.raise_for_status()
-            users = response.json().get("items", [])
-        except Exception:
-            return default
-
-        user = None
-
-        if name:
-            user = next(
-                (u for u in users
-                 if u.get("kind") == "User" and u["metadata"].get("name", "").casefold() == name.casefold()),
-                None
-            )
-        if not user and email:
-            user = next(
-                (u for u in users
-                 if u.get("kind") == "User" and u["metadata"].get("email", "").casefold() == email.casefold()),
-                None
-            )
-
-        if user:
-            unix_name = user["metadata"].get("unix_name")
-            if not unix_name:
-                return default
-            try:
-                detail_resp = requests.get(
-                    f"https://api.ci-connect.net:18080/v1alpha1/users/{unix_name}?token={apitoken}",
-                    timeout=5
-                )
-                detail_resp.raise_for_status()
-                user_detail = detail_resp.json()
-                memberships = user_detail.get("metadata", {}).get("group_memberships", [])
-                if any(
-                    m for m in memberships
-                    if m.get("name") == "root.atlas-af" and m.get("state") in {"active", "admin"}
-                ):
-                    return unix_name
-            except Exception:
-                return default
-        return default
-
     async def _submit_job(self, script_filename: str) -> str:
         """
         Submits a HTCondor job script and returns the output.
@@ -564,6 +516,9 @@ class ClusterInfo:
             for n in ("pending", "running", "succeeded", "failed"):
                 getattr(self, n).discard(pod_name)
 
+# Define a default function
+def default_userlookup_fn(x):
+    return x
 
 class KubeController(KubeBackendAndControllerMixin, Application):
     """Kubernetes controller for dask-gateway"""
@@ -585,6 +540,11 @@ class KubeController(KubeBackendAndControllerMixin, Application):
         "f": "KubeController.config_file",
         "config": "KubeController.config_file",
     }
+
+    userlookup_fn = CallableTrait(
+            default_value=default_userlookup_fn,
+            help="A processing function to apply."
+            ).tag(config=True)
 
     config_file = Unicode(
         "dask_gateway_config.py", help="The config file to load", config=True
@@ -710,6 +670,8 @@ class KubeController(KubeBackendAndControllerMixin, Application):
 
     # Fail if the config file errors
     raise_config_file_errors = True
+    def usermap(self, data):
+        return self.userlookup_fn(data)
 
     def handle_shutdown_signal(self, sig):
         self.log.warning("Received signal %s, initiating shutdown...", sig.name)
@@ -1094,7 +1056,7 @@ class KubeController(KubeBackendAndControllerMixin, Application):
             status = status.copy()
             status["phase"] = "Stopped"
             status["completionTime"] = k8s_timestamp()
-            user = GW_HTCJob.userlookup(email=cluster["spec"]["username"])
+            user = self.usermap(cluster["spec"]["username"])
             # remove htc jobs
             await self.handle_scale_down_htc(
                         cluster,
@@ -1199,7 +1161,7 @@ class KubeController(KubeBackendAndControllerMixin, Application):
             status["completionTime"] = k8s_timestamp()
 
         elif sched_state == "running":
-            user = GW_HTCJob.userlookup(email=cluster["spec"]["username"],log=self.log)
+            user = self.usermap(cluster["spec"]["username"])
             self.log.info("email: %s user: %s", cluster["spec"]["username"], user)
             summery = await GW_HTCJob.job_summery(name, user)
             self.log.debug("summery: %s", summery)
@@ -1215,6 +1177,7 @@ class KubeController(KubeBackendAndControllerMixin, Application):
                 n_workers = sum(map(len, summery.values()))
                 replicas = spec.get("replicas", 0)
                 self.log.info("cluster: %s - n_workers:%d, replicas: %d", name, n_workers, replicas)
+                #self.usermap(self.log)
 
                 delta = replicas - n_workers
                 if delta >= 0:
@@ -1423,7 +1386,7 @@ class KubeController(KubeBackendAndControllerMixin, Application):
                 statuses_to_check,
                 jobs_to_process
             )
-            user = GW_HTCJob.userlookup(email=cluster["spec"]["username"])
+            user = self.usermap(cluster["spec"]["username"])
             job_stops = [GW_HTCJob.stop_HTC(jid, user) for jid in jobs_to_process]
             res = await asyncio.gather(*job_stops, return_exceptions=True)
             self.log.debug("delete jobs stdout: %s",res)
