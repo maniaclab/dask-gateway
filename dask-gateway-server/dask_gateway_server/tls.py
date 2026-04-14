@@ -46,6 +46,9 @@ def new_keypair(sni):
         .subject_name(dask_internal)
         .issuer_name(dask_internal)
         .add_extension(altnames, critical=False)
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=None), critical=True
+        )
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
         .not_valid_before(now)
