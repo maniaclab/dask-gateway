@@ -358,7 +358,7 @@ class GW_HTCJob(HTCondorJob):
 
         input_files = ["/etc/condor/dask/env.sh"] + list(kube_controller.paths[name].values())
 
-        debug_logging = cluster["spec"]["config"].get("debug_logging", False)
+        debug_logging = cluster["spec"].get("options", {}).get("debug_logging", False)
 
         # Merge classAd attributes
         job_config = job_kwargs.copy()
