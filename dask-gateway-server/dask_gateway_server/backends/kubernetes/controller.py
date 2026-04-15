@@ -358,28 +358,44 @@ class GW_HTCJob(HTCondorJob):
 
         input_files = ["/etc/condor/dask/env.sh"] + list(kube_controller.paths[name].values())
 
+        debug_logging = cluster["spec"]["config"].get("debug_logging", False)
+
         # Merge classAd attributes
         job_config = job_kwargs.copy()
-        job_config["job_extra_directives"] = merge_dicts(
-            {
-                "universe": "docker",
-                "docker_image": worker_image,
-                "container_service_names": "dask,nanny",
-                "dask_container_port": scheduler_port,
-                "nanny_container_port": nanny_port,
-                "transfer_input_files": ", ".join(str(p) for p in input_files),
-                "transfer_output_files": "",
-                "when_to_transfer_output": "ON_EXIT",
-                "should_transfer_files": "YES",
-                "Stream_Output": "False",
-                "Stream_Error": "False",
-                "+queue": '"short"',
-                "Environment": (
-                    f'"DASK_GATEWAY_API_URL={kube_controller.api_url} '
-                    f'DASK_GATEWAY_CLUSTER_NAME={namespace}.{name}"'
+        extra_directives = {
+            "universe": "docker",
+            "docker_image": worker_image,
+            "container_service_names": "dask,nanny",
+            "dask_container_port": scheduler_port,
+            "nanny_container_port": nanny_port,
+            "transfer_input_files": ", ".join(str(p) for p in input_files),
+            "transfer_output_files": "",
+            "when_to_transfer_output": "ON_EXIT",
+            "should_transfer_files": "YES",
+            "Stream_Output": "False",
+            "Stream_Error": "False",
+            "+queue": '"short"',
+            "Environment": (
+                f'"DASK_GATEWAY_API_URL={kube_controller.api_url} '
+                f'DASK_GATEWAY_CLUSTER_NAME={namespace}.{name}"'
+            )
+        }
+
+        if debug_logging:
+            user = kube_controller.usermap(cluster["spec"]["username"])
+            log_dir = f"/home/{user}/.dask-gateway/{name}"
+            try:
+                run_as_user_sync(user, ["mkdir", "-p", log_dir])
+            except Exception as e:
+                kube_controller.log.warning(
+                    "Could not create log dir %s for cluster %s: %s", log_dir, name, e
                 )
-            }
-        )
+            extra_directives["Output"] = f"{log_dir}/$(Cluster).$(Process).out"
+            extra_directives["Error"] = f"{log_dir}/$(Cluster).$(Process).err"
+            extra_directives["Stream_Output"] = "True"
+            extra_directives["Stream_Error"] = "True"
+
+        job_config["job_extra_directives"] = merge_dicts(extra_directives)
         return job_config
 
     async def _submit_job(self, script_filename: str) -> str:
