@@ -362,6 +362,10 @@ class GW_HTCJob(HTCondorJob):
 
         # Merge classAd attributes
         job_config = job_kwargs.copy()
+        _banlist = ["c111", "c112", "c113", "c114", "c115"]
+        _banlist_expr = " || ".join(
+            f'Machine =?= "{h}.af.uchicago.edu"' for h in _banlist
+        )
         extra_directives = {
             "universe": "docker",
             "docker_image": worker_image,
@@ -375,6 +379,7 @@ class GW_HTCJob(HTCondorJob):
             "Stream_Output": "False",
             "Stream_Error": "False",
             "+queue": '"short"',
+            "Requirements": f"!({_banlist_expr})",
             "Environment": (
                 f'"DASK_GATEWAY_API_URL={kube_controller.api_url} '
                 f'DASK_GATEWAY_CLUSTER_NAME={namespace}.{name}"'
