@@ -1,0 +1,31 @@
+# zizmor configuration reference: https://docs.zizmor.sh/configuration/
+#
+# Every ignore below documents why the finding isn't being fixed as part of
+# CI-security hardening; each is a deliberate choice, not an oversight.
+#
+rules:
+  use-trusted-publishing:
+    ignore:
+      # Switching to PyPI Trusted Publishing (OIDC) requires configuring a
+      # trusted publisher in the dask-gateway and dask-gateway-server PyPI
+      # project settings first; that's a PyPI-side change coordinated by the
+      # package maintainers, not something this workflow change can do on
+      # its own.
+      - build-publish-python-packages.yaml:157:9
+      - build-publish-python-packages.yaml:167:9
+
+  superfluous-actions:
+    ignore:
+      # peter-evans/create-pull-request already handles idempotent
+      # branch/PR updates (reusing an existing branch, force-pushing only
+      # when content changed, etc). Reimplementing that with `gh pr create`
+      # in a script step would add complexity for no security benefit.
+      - refreeze-dockerfile-requirements-txt.yaml:63:15
+
+  adhoc-packages:
+    ignore:
+      # configurable-http-proxy is a single ad-hoc CLI dependency needed only
+      # to mock-start jupyterhub in tests; it is pinned to an exact version
+      # (@5.3.0). Adding a package.json/lockfile for this one dev dependency
+      # would be more complexity than it's worth.
+      - test.yaml:101:11

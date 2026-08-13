@@ -22,7 +22,7 @@
 repos:
   # Autoformat: Python code, syntax patterns are modernized
   - repo: https://github.com/asottile/pyupgrade
-    rev: v3.19.1
+    rev: 75992aaa40730136014f34227e0135f63fc951b4  # frozen: v3.21.2
     hooks:
       - id: pyupgrade
         args:
@@ -30,19 +30,23 @@ repos:
 
   # Autoformat: Python code
   - repo: https://github.com/PyCQA/isort
-    rev: "6.0.0"
+    rev: "a333737ed43df02b18e6c95477ea1b285b3de15a"  # frozen: 8.0.1
     hooks:
       - id: isort
 
   # Autoformat: Python code
+  #
+  # Held at 25.1.0: 26.x reformats dask-gateway/dask_gateway/options.py
+  # differently, which is an unrelated source-code change outside the scope
+  # of this CI security hardening pass.
   - repo: https://github.com/psf/black
-    rev: "25.1.0"
+    rev: "8a737e727ac5ab2f1d4cf5876720ed276dc8dc4b"  # frozen: 25.1.0
     hooks:
       - id: black
 
   # Autoformat: general small fixes
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v5.0.0
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c  # frozen: v6.0.0
     hooks:
       - id: end-of-file-fixer
         exclude_types: ["svg"]
@@ -50,9 +54,17 @@ repos:
 
   # Lint: Python code
   - repo: https://github.com/PyCQA/flake8
-    rev: "7.1.1"
+    rev: "c48217e1fc006c2dddd14df54e83b67da15de5cd"  # frozen: 7.3.0
     hooks:
       - id: flake8
+
+  # Lint: GitHub Actions workflows for security issues
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: 451b56af716f9f0d0c2b816503a3fd0cf8b036fa # frozen: v1.29.0
+    hooks:
+      - id: zizmor
+        files: "^\\.github"
+        args: [--persona=pedantic]
 
 # pre-commit.ci config reference: https://pre-commit.ci/#configuration
 ci:
