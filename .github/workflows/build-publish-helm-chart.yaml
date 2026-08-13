@@ -8,16 +8,20 @@ on:
     tags: ["**"]
   workflow_dispatch:
 
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-publish-helm-chart:
     name: "Build and publish Helm chart"
     runs-on: ubuntu-24.04
 
-    # permissions requested for secrets.github_token in order to push to the
-    # container registry, available for push and workflow_dispatch triggers.
     permissions:
-      contents: read
-      packages: write
+      contents: read # checkout the repo, chartpress needs git history
+      packages: write # push the built image to the ghcr.io container registry
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -25,6 +29,7 @@ jobs:
           # chartpress requires git history to set chart version and image tags
           # correctly
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
@@ -44,7 +49,9 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Login to container registry
-        run: echo "${{ secrets.github_token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+        env:
+          GH_TOKEN: ${{ secrets.github_token }}
+        run: echo "${GH_TOKEN}" | docker login ghcr.io -u ${GITHUB_ACTOR} --password-stdin
 
       # chartpress pushes a packages Helm chart to dask/helm-chart's gh-pages
       # branch, so we need to have a git user.email and user.name configured

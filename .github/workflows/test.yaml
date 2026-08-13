@@ -25,11 +25,20 @@ on:
 env:
   commit_msg: ${{ github.event.head_commit.message }}
 
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   local-tests:
     name: "local backend"
     runs-on: ubuntu-24.04
     timeout-minutes: 7
+
+    permissions:
+      contents: read # checkout the repo
 
     strategy:
       fail-fast: false
@@ -68,6 +77,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "${{ matrix.python-version }}"
@@ -75,14 +86,19 @@ jobs:
         with:
           go-version: "${{ matrix.go-version }}"
           cache-dependency-path: "**/*.sum"
+          cache: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          # We only install a global CLI tool (no package.json in this repo),
+          # so there is nothing worth caching here.
+          package-manager-cache: false
 
       # jupyterhub will when being mock started as part of running tests depend
       # on the Node npm package configurable-http-proxy.
       #
       - name: Install jupyterhub with system dependencies
         run: |
-          npm install -g configurable-http-proxy
+          npm install -g configurable-http-proxy@5.3.0
           pip install jupyterhub
 
       - name: Install Python test requirements
@@ -135,6 +151,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
 
+    permissions:
+      contents: read # checkout the repo
+
+    env:
+      # matrix values interpolated into env vars, rather than directly into
+      # run: scripts, to avoid shell injection via template expansion
+      SEPARATE_NAMESPACE: ${{ matrix.separate-namespace || 'default' }}
+      UPGRADE_FROM: ${{ matrix.upgrade-from }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -161,6 +186,7 @@ jobs:
           # chartpress requires git history to set chart version and image tags
           # correctly
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
@@ -198,7 +224,7 @@ jobs:
 
       - if: matrix.separate-namespace != ''
         run: |
-          kubectl create namespace ${{ matrix.separate-namespace }} || true
+          kubectl create namespace "${SEPARATE_NAMESPACE}" || true
 
       - name: helm install previous version ${{ matrix.upgrade-from }}
         if: matrix.upgrade-from != ''
@@ -211,7 +237,7 @@ jobs:
               test-dask-gateway \
               dask-gateway \
               --repo=https://helm.dask.org \
-              --version=${{ matrix.upgrade-from }} \
+              --version="${UPGRADE_FROM}" \
               --values=chart-install-values.yaml \
               --wait \
               --timeout 1m0s
@@ -245,7 +271,7 @@ jobs:
               resources/helm/dask-gateway \
               --install \
               --values=resources/helm/testing/chart-install-values.yaml \
-              --set gateway.backend.namespace=${{ matrix.separate-namespace || 'default' }} \
+              --set gateway.backend.namespace="${SEPARATE_NAMESPACE}" \
               --wait \
               --timeout 1m0s
 
@@ -270,17 +296,18 @@ jobs:
               test-dask-gateway \
               resources/helm/dask-gateway \
               --values=resources/helm/testing/chart-install-values.yaml \
-              --set gateway.backend.namespace=${{ matrix.separate-namespace || 'default' }} \
+              --set gateway.backend.namespace="${SEPARATE_NAMESPACE}" \
               --set traefik.installTraefik=false \
               --skip-crds \
               --wait \
               --timeout 1m0s
 
       - name: pytest
+        env:
+          TEST_DASK_GATEWAY_KUBE: "true"
+          TEST_DASK_GATEWAY_KUBE_ADDRESS: http://localhost:30200/services/dask-gateway/
+          TEST_DASK_GATEWAY_KUBE_NAMESPACE: ${{ env.SEPARATE_NAMESPACE }}
         run: |
-          TEST_DASK_GATEWAY_KUBE=true \
-          TEST_DASK_GATEWAY_KUBE_ADDRESS=http://localhost:30200/services/dask-gateway/ \
-          TEST_DASK_GATEWAY_KUBE_NAMESPACE=${{ matrix.separate-namespace || 'default' }} \
           pytest -v tests/kubernetes
 
       # ref: https://github.com/jupyterhub/action-k8s-namespace-report
@@ -303,10 +330,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
 
-    # packages read access is required for pull to the backend containers
     permissions:
-      contents: read
-      packages: read
+      contents: read # checkout the repo
+      packages: read # pull the backend containers from ghcr.io
+
+    env:
+      # matrix value interpolated into an env var, rather than directly into
+      # run: scripts, to avoid shell injection via template expansion
+      BACKEND: ${{ matrix.backend }}
 
     strategy:
       fail-fast: false
@@ -318,19 +349,23 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Login to ghcr.io read access to CI image
-        run: echo "${{ secrets.github_token }}" | docker login ghcr.io -u $ --password-stdin
+        env:
+          GH_TOKEN: ${{ secrets.github_token }}
+        run: echo "${GH_TOKEN}" | docker login ghcr.io -u $ --password-stdin
 
       - name: Start container and mount local git repo
-        run: ./continuous_integration/docker/${{ matrix.backend }}/start.sh
+        run: ./continuous_integration/docker/"${BACKEND}"/start.sh
 
       - name: Install test requirements (inside container)
-        run: ./continuous_integration/docker/${{ matrix.backend }}/install.sh
+        run: ./continuous_integration/docker/"${BACKEND}"/install.sh
 
       - name: Run tests (inside container)
-        run: ./continuous_integration/docker/${{ matrix.backend }}/test.sh
+        run: ./continuous_integration/docker/"${BACKEND}"/test.sh
 
       - name: Print logs for debugging
         if: always()
-        run: ./continuous_integration/docker/${{ matrix.backend }}/print_logs.sh
+        run: ./continuous_integration/docker/"${BACKEND}"/print_logs.sh
